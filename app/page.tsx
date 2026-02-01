@@ -1,90 +1,209 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 
 // Types
 interface Token {
-  id: string;
   symbol: string;
   name: string;
   price: number;
+  prevPrice: number;
   change24h: number;
-  tier: string;
+  rsi: number;
+  signal: 'BUY' | 'SELL' | 'HOLD';
 }
 
 interface Position {
   id: number;
   symbol: string;
+  side: 'LONG';
   entryPrice: number;
+  currentPrice: number;
   quantity: number;
   valueEUR: number;
+  pnl: number;
+  pnlPercent: number;
   stopLoss: number;
   takeProfit: number;
-  timestamp: string;
+  openedAt: Date;
 }
 
-interface Trade extends Position {
-  status: string;
-  closePrice?: number;
-  closePnL?: number;
+interface Trade {
+  id: number;
+  symbol: string;
+  side: 'LONG';
+  entryPrice: number;
+  exitPrice: number;
+  quantity: number;
+  pnl: number;
+  pnlPercent: number;
+  result: 'WIN' | 'LOSS';
+  reason: 'TP' | 'SL' | 'SIGNAL';
+  openedAt: Date;
+  closedAt: Date;
+}
+
+interface LogEntry {
+  time: Date;
+  type: 'INFO' | 'BUY' | 'SELL' | 'TP' | 'SL' | 'SIGNAL';
+  message: string;
 }
 
 // Config
-const TOKENS = [
-  { id: 'solana', symbol: 'SOL', name: 'Solana', tier: 'blue-chip' },
-  { id: 'bonk', symbol: 'BONK', name: 'Bonk', tier: 'meme' },
-  { id: 'dogwifcoin', symbol: 'WIF', name: 'dogwifhat', tier: 'meme' },
-  { id: 'jupiter-exchange-solana', symbol: 'JUP', name: 'Jupiter', tier: 'defi' },
-  { id: 'pyth-network', symbol: 'PYTH', name: 'Pyth', tier: 'infra' },
-  { id: 'raydium', symbol: 'RAY', name: 'Raydium', tier: 'defi' },
-  { id: 'render-token', symbol: 'RENDER', name: 'Render', tier: 'ai' },
-  { id: 'jito-governance-token', symbol: 'JTO', name: 'Jito', tier: 'infra' },
+const TOKENS_CONFIG = [
+  { id: 'solana', symbol: 'SOL', name: 'Solana' },
+  { id: 'bonk', symbol: 'BONK', name: 'Bonk' },
+  { id: 'dogwifcoin', symbol: 'WIF', name: 'dogwifhat' },
+  { id: 'jupiter-exchange-solana', symbol: 'JUP', name: 'Jupiter' },
+  { id: 'popcat', symbol: 'POPCAT', name: 'Popcat' },
+  { id: 'render-token', symbol: 'RENDER', name: 'Render' },
 ];
 
-const INITIAL_BALANCE = 1000;
-const STOP_LOSS = 0.025;
-const TAKE_PROFIT = 0.06;
-const EUR_RATE = 0.92;
+const CONFIG = {
+  INITIAL_BALANCE: 1000,
+  POSITION_SIZE: 0.15,      // 15% per trade
+  MAX_POSITIONS: 4,
+  STOP_LOSS: 0.03,          // 3%
+  TAKE_PROFIT: 0.08,        // 8%
+  RSI_BUY: 35,              // Buy when RSI < 35
+  RSI_SELL: 70,             // Sell when RSI > 70
+  MIN_CHANGE_BUY: -3,       // Buy on 3%+ dip
+  POLL_INTERVAL: 15000,     // 15 seconds
+};
 
-export default function Home() {
-  const [balance, setBalance] = useState(INITIAL_BALANCE);
+export default function TradingBot() {
+  const [balance, setBalance] = useState(CONFIG.INITIAL_BALANCE);
   const [positions, setPositions] = useState<Position[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [tokens, setTokens] = useState<Token[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [isRunning, setIsRunning] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  const priceHistory = useRef<{ [symbol: string]: number[] }>({});
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Fetch prices from CoinGecko
-  const fetchPrices = useCallback(async () => {
+  const addLog = (type: LogEntry['type'], message: string) => {
+    setLogs(prev => [{ time: new Date(), type, message }, ...prev].slice(0, 100));
+  };
+
+  // Calculate RSI
+  const calculateRSI = (prices: number[], period = 14): number => {
+    if (prices.length < period + 1) return 50;
+    
+    let gains = 0, losses = 0;
+    for (let i = prices.length - period; i < prices.length; i++) {
+      const change = prices[i] - prices[i - 1];
+      if (change > 0) gains += change;
+      else losses -= change;
+    }
+    
+    const avgGain = gains / period;
+    const avgLoss = losses / period;
+    if (avgLoss === 0) return 100;
+    
+    const rs = avgGain / avgLoss;
+    return 100 - (100 / (1 + rs));
+  };
+
+  // Determine signal
+  const getSignal = (rsi: number, change24h: number): 'BUY' | 'SELL' | 'HOLD' => {
+    if (rsi < CONFIG.RSI_BUY && change24h < CONFIG.MIN_CHANGE_BUY) return 'BUY';
+    if (rsi > CONFIG.RSI_SELL) return 'SELL';
+    return 'HOLD';
+  };
+
+  // Fetch prices
+  const fetchPrices = async () => {
     try {
-      const ids = TOKENS.map(t => t.id).join(',');
+      const ids = TOKENS_CONFIG.map(t => t.id).join(',');
       const res = await fetch(
-        `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`
+        `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`,
+        { cache: 'no-store' }
       );
       const data = await res.json();
-      
-      const updatedTokens = TOKENS.map(t => ({
-        ...t,
-        price: data[t.id]?.usd || 0,
-        change24h: data[t.id]?.usd_24h_change || 0,
-      }));
-      
+
+      const updatedTokens: Token[] = TOKENS_CONFIG.map(t => {
+        const price = data[t.id]?.usd || 0;
+        const change24h = data[t.id]?.usd_24h_change || 0;
+        
+        // Update price history
+        if (!priceHistory.current[t.symbol]) {
+          priceHistory.current[t.symbol] = [];
+        }
+        priceHistory.current[t.symbol].push(price);
+        if (priceHistory.current[t.symbol].length > 50) {
+          priceHistory.current[t.symbol].shift();
+        }
+        
+        const rsi = calculateRSI(priceHistory.current[t.symbol]);
+        const signal = getSignal(rsi, change24h);
+        const prevPrice = tokens.find(tok => tok.symbol === t.symbol)?.price || price;
+
+        return {
+          symbol: t.symbol,
+          name: t.name,
+          price,
+          prevPrice,
+          change24h,
+          rsi,
+          signal,
+        };
+      });
+
       setTokens(updatedTokens);
       setLastUpdate(new Date());
-      setLoading(false);
-      
-      // Check positions for SL/TP
-      checkPositions(updatedTokens);
-    } catch (error) {
-      console.error('Price fetch error:', error);
-    }
-  }, []);
 
-  // Check positions for stop loss / take profit
+      if (isRunning) {
+        processSignals(updatedTokens);
+        checkPositions(updatedTokens);
+      }
+    } catch (error) {
+      addLog('INFO', `Price fetch error: ${error}`);
+    }
+  };
+
+  // Process trading signals
+  const processSignals = (currentTokens: Token[]) => {
+    currentTokens.forEach(token => {
+      if (token.signal === 'BUY' && token.price > 0) {
+        const hasPosition = positions.some(p => p.symbol === token.symbol);
+        if (!hasPosition && positions.length < CONFIG.MAX_POSITIONS && balance > 50) {
+          openPosition(token);
+        }
+      }
+    });
+  };
+
+  // Open a position
+  const openPosition = (token: Token) => {
+    const tradeValue = Math.min(balance * CONFIG.POSITION_SIZE, balance - 10);
+    if (tradeValue < 20) return;
+
+    const quantity = tradeValue / token.price;
+    const position: Position = {
+      id: Date.now(),
+      symbol: token.symbol,
+      side: 'LONG',
+      entryPrice: token.price,
+      currentPrice: token.price,
+      quantity,
+      valueEUR: tradeValue,
+      pnl: 0,
+      pnlPercent: 0,
+      stopLoss: token.price * (1 - CONFIG.STOP_LOSS),
+      takeProfit: token.price * (1 + CONFIG.TAKE_PROFIT),
+      openedAt: new Date(),
+    };
+
+    setPositions(prev => [...prev, position]);
+    setBalance(prev => prev - tradeValue);
+    addLog('BUY', `🟢 OPENED ${token.symbol} @ $${token.price.toFixed(4)} | Size: €${tradeValue.toFixed(2)} | SL: $${position.stopLoss.toFixed(4)} | TP: $${position.takeProfit.toFixed(4)}`);
+  };
+
+  // Check positions for SL/TP
   const checkPositions = (currentTokens: Token[]) => {
     setPositions(prev => {
       const stillOpen: Position[] = [];
-      const toClose: Trade[] = [];
       
       prev.forEach(pos => {
         const token = currentTokens.find(t => t.symbol === pos.symbol);
@@ -92,280 +211,247 @@ export default function Home() {
           stillOpen.push(pos);
           return;
         }
-        
+
         const currentPrice = token.price;
-        const pnlUSD = (currentPrice - pos.entryPrice) * pos.quantity;
-        const pnlEUR = pnlUSD * EUR_RATE;
-        
+        const pnl = (currentPrice - pos.entryPrice) * pos.quantity;
+        const pnlPercent = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
+
+        // Check Stop Loss
         if (currentPrice <= pos.stopLoss) {
-          toClose.push({
-            ...pos,
-            status: 'SL HIT ❌',
-            closePrice: currentPrice,
-            closePnL: pnlEUR,
-          });
-          setBalance(b => b + pos.valueEUR + pnlEUR);
-        } else if (currentPrice >= pos.takeProfit) {
-          toClose.push({
-            ...pos,
-            status: 'TP HIT ✅',
-            closePrice: currentPrice,
-            closePnL: pnlEUR,
-          });
-          setBalance(b => b + pos.valueEUR + pnlEUR);
-        } else {
-          stillOpen.push(pos);
+          closeTrade(pos, currentPrice, 'SL');
+          return;
         }
+
+        // Check Take Profit
+        if (currentPrice >= pos.takeProfit) {
+          closeTrade(pos, currentPrice, 'TP');
+          return;
+        }
+
+        // Check sell signal
+        if (token.signal === 'SELL' && pnl > 0) {
+          closeTrade(pos, currentPrice, 'SIGNAL');
+          return;
+        }
+
+        // Update position
+        stillOpen.push({
+          ...pos,
+          currentPrice,
+          pnl,
+          pnlPercent,
+        });
       });
-      
-      if (toClose.length > 0) {
-        setTrades(t => [...toClose, ...t]);
-      }
-      
+
       return stillOpen;
     });
   };
 
-  // Execute a trade
-  const executeTrade = (symbol: string) => {
-    const token = tokens.find(t => t.symbol === symbol);
-    if (!token || token.price === 0) return;
-    
-    const tradeSize = Math.min(100, balance * 0.1); // Max 10% or €100
-    if (tradeSize < 10) {
-      alert('Insufficient balance');
-      return;
-    }
-    
-    const tradeSizeUSD = tradeSize / EUR_RATE;
-    const quantity = tradeSizeUSD / token.price;
-    
-    const position: Position = {
-      id: Date.now(),
-      symbol,
-      entryPrice: token.price,
-      quantity,
-      valueEUR: tradeSize,
-      stopLoss: token.price * (1 - STOP_LOSS),
-      takeProfit: token.price * (1 + TAKE_PROFIT),
-      timestamp: new Date().toISOString(),
+  // Close a trade
+  const closeTrade = (pos: Position, exitPrice: number, reason: 'TP' | 'SL' | 'SIGNAL') => {
+    const pnl = (exitPrice - pos.entryPrice) * pos.quantity;
+    const pnlPercent = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+    const returnValue = pos.valueEUR + pnl;
+
+    const trade: Trade = {
+      id: pos.id,
+      symbol: pos.symbol,
+      side: 'LONG',
+      entryPrice: pos.entryPrice,
+      exitPrice,
+      quantity: pos.quantity,
+      pnl,
+      pnlPercent,
+      result: pnl >= 0 ? 'WIN' : 'LOSS',
+      reason,
+      openedAt: pos.openedAt,
+      closedAt: new Date(),
     };
+
+    setTrades(prev => [trade, ...prev]);
+    setBalance(prev => prev + returnValue);
     
-    setBalance(b => b - tradeSize);
-    setPositions(p => [...p, position]);
-    setTrades(t => [{ ...position, status: 'OPEN' }, ...t]);
+    const emoji = pnl >= 0 ? '✅' : '❌';
+    const reasonText = reason === 'TP' ? 'TAKE PROFIT' : reason === 'SL' ? 'STOP LOSS' : 'SIGNAL';
+    addLog(reason, `${emoji} CLOSED ${pos.symbol} @ $${exitPrice.toFixed(4)} | ${reasonText} | PnL: €${pnl.toFixed(2)} (${pnlPercent.toFixed(1)}%)`);
   };
 
-  // Close a position manually
-  const closePosition = (posId: number) => {
-    setPositions(prev => {
-      const pos = prev.find(p => p.id === posId);
-      if (!pos) return prev;
-      
-      const token = tokens.find(t => t.symbol === pos.symbol);
-      const currentPrice = token?.price || pos.entryPrice;
-      const pnlUSD = (currentPrice - pos.entryPrice) * pos.quantity;
-      const pnlEUR = pnlUSD * EUR_RATE;
-      
-      setBalance(b => b + pos.valueEUR + pnlEUR);
-      setTrades(t => [{
-        ...pos,
-        status: 'CLOSED',
-        closePrice: currentPrice,
-        closePnL: pnlEUR,
-      }, ...t]);
-      
-      return prev.filter(p => p.id !== posId);
-    });
-  };
-
-  // Reset everything
-  const resetAll = () => {
-    if (confirm('Reset all trades and balance?')) {
-      setBalance(INITIAL_BALANCE);
-      setPositions([]);
-      setTrades([]);
+  // Toggle bot
+  const toggleBot = () => {
+    if (isRunning) {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      addLog('INFO', '⏹️ Bot stopped');
+    } else {
+      addLog('INFO', '▶️ Bot started - scanning for opportunities...');
+      fetchPrices();
+      intervalRef.current = setInterval(fetchPrices, CONFIG.POLL_INTERVAL);
     }
+    setIsRunning(!isRunning);
   };
 
-  // Calculate totals
-  const positionsValue = positions.reduce((sum, pos) => {
-    const token = tokens.find(t => t.symbol === pos.symbol);
-    const currentPrice = token?.price || pos.entryPrice;
-    return sum + (currentPrice * pos.quantity * EUR_RATE);
-  }, 0);
-  
-  const totalValue = balance + positionsValue;
-  const totalPnL = totalValue - INITIAL_BALANCE;
-  const returnPct = (totalPnL / INITIAL_BALANCE) * 100;
+  // Reset bot
+  const resetBot = () => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    setIsRunning(false);
+    setBalance(CONFIG.INITIAL_BALANCE);
+    setPositions([]);
+    setTrades([]);
+    setLogs([]);
+    priceHistory.current = {};
+    addLog('INFO', '🔄 Bot reset to initial state');
+  };
 
-  // Fetch on mount and interval
+  // Initial fetch
   useEffect(() => {
     fetchPrices();
-    const interval = setInterval(fetchPrices, 15000); // Every 15s
-    return () => clearInterval(interval);
-  }, [fetchPrices]);
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, []);
 
-  const formatPrice = (p: number) => p < 0.001 ? p.toFixed(8) : p < 1 ? p.toFixed(6) : p.toFixed(2);
+  // Stats
+  const totalPnL = trades.reduce((sum, t) => sum + t.pnl, 0);
+  const winRate = trades.length > 0 
+    ? (trades.filter(t => t.result === 'WIN').length / trades.length * 100).toFixed(0) 
+    : '0';
+  const openPnL = positions.reduce((sum, p) => sum + p.pnl, 0);
 
   return (
-    <main className="min-h-screen bg-[#0a0a0a] text-gray-100 p-4 md:p-8">
+    <div className="min-h-screen bg-[#0a0a0a] text-white p-4 md:p-6">
+      {/* Header */}
       <div className="max-w-7xl mx-auto">
-        {/* Header */}
-        <div className="flex justify-between items-center mb-8 pb-4 border-b border-gray-800">
+        <div className="flex items-center justify-between mb-6">
           <div>
-            <h1 className="text-2xl font-bold text-[#14F195]">◎ SOL TRADER</h1>
-            <p className="text-gray-500 text-sm">Paper Trading Simulator</p>
+            <h1 className="text-2xl font-bold">🤖 SOL Paper Trader</h1>
+            <p className="text-zinc-500 text-sm">Real prices, fake money, real learnings</p>
           </div>
-          <div className="flex items-center gap-4">
-            <span className="text-xs text-gray-500">
-              {lastUpdate ? `Updated: ${lastUpdate.toLocaleTimeString()}` : 'Loading...'}
-            </span>
-            <span className="bg-[#14F195] text-black px-3 py-1 rounded-full text-xs font-bold">
-              PAPER MODE
-            </span>
-          </div>
-        </div>
-
-        {/* Stats */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <p className="text-gray-500 text-xs uppercase">Portfolio Value</p>
-            <p className="text-2xl font-bold">€{totalValue.toFixed(2)}</p>
-          </div>
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <p className="text-gray-500 text-xs uppercase">Cash Balance</p>
-            <p className="text-2xl font-bold">€{balance.toFixed(2)}</p>
-          </div>
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <p className="text-gray-500 text-xs uppercase">Total P&L</p>
-            <p className={`text-2xl font-bold ${totalPnL >= 0 ? 'text-[#14F195]' : 'text-red-500'}`}>
-              {totalPnL >= 0 ? '+' : ''}€{totalPnL.toFixed(2)}
-            </p>
-            <p className={`text-sm ${totalPnL >= 0 ? 'text-[#14F195]' : 'text-red-500'}`}>
-              {returnPct >= 0 ? '+' : ''}{returnPct.toFixed(2)}%
-            </p>
-          </div>
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <p className="text-gray-500 text-xs uppercase">Open Positions</p>
-            <p className="text-2xl font-bold">{positions.length}</p>
-            <button 
-              onClick={resetAll}
-              className="text-xs text-gray-500 hover:text-red-500 mt-1"
+          <div className="flex gap-2">
+            <button
+              onClick={toggleBot}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                isRunning 
+                  ? 'bg-red-600 hover:bg-red-500' 
+                  : 'bg-green-600 hover:bg-green-500'
+              }`}
             >
-              Reset All
+              {isRunning ? '⏹️ Stop' : '▶️ Start'}
+            </button>
+            <button
+              onClick={resetBot}
+              className="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 rounded-lg font-medium transition-colors"
+            >
+              🔄 Reset
             </button>
           </div>
         </div>
 
-        {/* Tokens */}
-        <div className="bg-gray-900 rounded-xl p-4 border border-gray-800 mb-8">
-          <h2 className="text-gray-400 text-sm uppercase mb-4">Market • Click to Trade</h2>
-          {loading ? (
-            <p className="text-gray-500">Loading prices...</p>
-          ) : (
-            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
-              {tokens.map(token => {
-                const hasPosition = positions.some(p => p.symbol === token.symbol);
-                return (
-                  <button
-                    key={token.symbol}
-                    onClick={() => !hasPosition && executeTrade(token.symbol)}
-                    disabled={hasPosition}
-                    className={`bg-gray-800 rounded-lg p-3 text-center hover:bg-gray-700 transition ${
-                      hasPosition ? 'opacity-50 cursor-not-allowed ring-2 ring-[#14F195]' : ''
-                    }`}
-                  >
-                    <p className="font-bold">{token.symbol}</p>
-                    <p className="text-sm text-gray-400">${formatPrice(token.price)}</p>
-                    <p className={`text-xs ${token.change24h >= 0 ? 'text-[#14F195]' : 'text-red-500'}`}>
-                      {token.change24h >= 0 ? '+' : ''}{token.change24h.toFixed(2)}%
-                    </p>
-                    {hasPosition && <p className="text-[10px] text-[#14F195] mt-1">OPEN</p>}
-                  </button>
-                );
-              })}
+        {/* Stats Cards */}
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
+          <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+            <div className="text-zinc-500 text-sm">Balance</div>
+            <div className="text-xl font-bold">€{balance.toFixed(2)}</div>
+          </div>
+          <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+            <div className="text-zinc-500 text-sm">Open PnL</div>
+            <div className={`text-xl font-bold ${openPnL >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              €{openPnL.toFixed(2)}
             </div>
-          )}
+          </div>
+          <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+            <div className="text-zinc-500 text-sm">Closed PnL</div>
+            <div className={`text-xl font-bold ${totalPnL >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              €{totalPnL.toFixed(2)}
+            </div>
+          </div>
+          <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+            <div className="text-zinc-500 text-sm">Win Rate</div>
+            <div className="text-xl font-bold">{winRate}%</div>
+          </div>
+          <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+            <div className="text-zinc-500 text-sm">Trades</div>
+            <div className="text-xl font-bold">{trades.length}</div>
+          </div>
         </div>
 
-        {/* Positions & Trades */}
-        <div className="grid md:grid-cols-2 gap-4">
-          {/* Open Positions */}
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <h2 className="text-gray-400 text-sm uppercase mb-4">Open Positions</h2>
-            {positions.length === 0 ? (
-              <p className="text-gray-600 text-center py-8">No open positions</p>
-            ) : (
-              <div className="space-y-3">
-                {positions.map(pos => {
-                  const token = tokens.find(t => t.symbol === pos.symbol);
-                  const currentPrice = token?.price || pos.entryPrice;
-                  const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
-                  const pnlEUR = (currentPrice - pos.entryPrice) * pos.quantity * EUR_RATE;
-                  
-                  return (
-                    <div key={pos.id} className="bg-gray-800 rounded-lg p-3">
-                      <div className="flex justify-between items-start">
-                        <div>
-                          <p className="font-bold">{pos.symbol}</p>
-                          <p className="text-xs text-gray-500">
-                            Entry: ${formatPrice(pos.entryPrice)} → ${formatPrice(currentPrice)}
-                          </p>
-                        </div>
-                        <div className="text-right">
-                          <p className={`font-bold ${pnlPct >= 0 ? 'text-[#14F195]' : 'text-red-500'}`}>
-                            {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
-                          </p>
-                          <p className={`text-sm ${pnlEUR >= 0 ? 'text-[#14F195]' : 'text-red-500'}`}>
-                            €{pnlEUR.toFixed(2)}
-                          </p>
-                        </div>
-                      </div>
-                      <div className="flex justify-between items-center mt-2 text-xs text-gray-500">
-                        <span>SL: ${formatPrice(pos.stopLoss)} | TP: ${formatPrice(pos.takeProfit)}</span>
-                        <button 
-                          onClick={() => closePosition(pos.id)}
-                          className="text-red-500 hover:text-red-400"
-                        >
-                          Close
-                        </button>
-                      </div>
+        <div className="grid lg:grid-cols-3 gap-6">
+          {/* Token Prices */}
+          <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+            <h2 className="font-semibold mb-3 flex items-center justify-between">
+              📊 Live Prices
+              {lastUpdate && (
+                <span className="text-xs text-zinc-500">
+                  {lastUpdate.toLocaleTimeString()}
+                </span>
+              )}
+            </h2>
+            <div className="space-y-2">
+              {tokens.map(token => (
+                <div key={token.symbol} className="flex items-center justify-between p-2 bg-zinc-800/50 rounded-lg">
+                  <div>
+                    <span className="font-medium">{token.symbol}</span>
+                    <span className={`ml-2 text-xs px-1.5 py-0.5 rounded ${
+                      token.signal === 'BUY' ? 'bg-green-600' : 
+                      token.signal === 'SELL' ? 'bg-red-600' : 'bg-zinc-600'
+                    }`}>
+                      {token.signal}
+                    </span>
+                  </div>
+                  <div className="text-right">
+                    <div className="font-mono">${token.price.toFixed(token.price < 0.01 ? 6 : 2)}</div>
+                    <div className={`text-xs ${token.change24h >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {token.change24h >= 0 ? '+' : ''}{token.change24h.toFixed(1)}% · RSI {token.rsi.toFixed(0)}
                     </div>
-                  );
-                })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Open Positions */}
+          <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+            <h2 className="font-semibold mb-3">📈 Open Positions ({positions.length}/{CONFIG.MAX_POSITIONS})</h2>
+            {positions.length === 0 ? (
+              <div className="text-zinc-500 text-center py-8">
+                {isRunning ? 'Waiting for signals...' : 'Start bot to trade'}
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {positions.map(pos => (
+                  <div key={pos.id} className="p-3 bg-zinc-800/50 rounded-lg">
+                    <div className="flex justify-between items-start mb-1">
+                      <span className="font-medium">{pos.symbol}</span>
+                      <span className={`font-mono ${pos.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        €{pos.pnl.toFixed(2)} ({pos.pnlPercent.toFixed(1)}%)
+                      </span>
+                    </div>
+                    <div className="text-xs text-zinc-500 space-y-0.5">
+                      <div>Entry: ${pos.entryPrice.toFixed(4)} → ${pos.currentPrice.toFixed(4)}</div>
+                      <div>SL: ${pos.stopLoss.toFixed(4)} | TP: ${pos.takeProfit.toFixed(4)}</div>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>
 
           {/* Trade History */}
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <h2 className="text-gray-400 text-sm uppercase mb-4">Trade History</h2>
+          <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+            <h2 className="font-semibold mb-3">📜 Trade History</h2>
             {trades.length === 0 ? (
-              <p className="text-gray-600 text-center py-8">No trades yet</p>
+              <div className="text-zinc-500 text-center py-8">No trades yet</div>
             ) : (
-              <div className="space-y-2 max-h-[400px] overflow-y-auto">
-                {trades.slice(0, 20).map((trade, i) => (
-                  <div key={`${trade.id}-${i}`} className="bg-gray-800 rounded-lg p-3 text-sm">
+              <div className="space-y-2 max-h-64 overflow-y-auto">
+                {trades.slice(0, 20).map(trade => (
+                  <div key={trade.id} className="p-2 bg-zinc-800/50 rounded-lg text-sm">
                     <div className="flex justify-between">
-                      <span className="font-bold">{trade.symbol}</span>
-                      <span className={`text-xs px-2 py-0.5 rounded ${
-                        trade.status.includes('TP') ? 'bg-[#14F195] text-black' :
-                        trade.status.includes('SL') ? 'bg-red-500 text-white' :
-                        trade.status === 'OPEN' ? 'bg-blue-500 text-white' :
-                        'bg-gray-600'
-                      }`}>
-                        {trade.status}
+                      <span>{trade.result === 'WIN' ? '✅' : '❌'} {trade.symbol}</span>
+                      <span className={trade.pnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+                        €{trade.pnl.toFixed(2)}
                       </span>
                     </div>
-                    {trade.closePnL !== undefined && (
-                      <p className={`text-xs ${trade.closePnL >= 0 ? 'text-[#14F195]' : 'text-red-500'}`}>
-                        P&L: {trade.closePnL >= 0 ? '+' : ''}€{trade.closePnL.toFixed(2)}
-                      </p>
-                    )}
-                    <p className="text-xs text-gray-500">
-                      {new Date(trade.timestamp).toLocaleString()}
-                    </p>
+                    <div className="text-xs text-zinc-500">
+                      {trade.reason} · {trade.pnlPercent.toFixed(1)}%
+                    </div>
                   </div>
                 ))}
               </div>
@@ -373,12 +459,33 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Footer */}
-        <div className="text-center text-gray-600 text-xs mt-8 pt-4 border-t border-gray-800">
-          <p>SOL Trader • Paper Trading Simulator • Built by Nodefy AI 🚀</p>
-          <p className="mt-1">SL: {STOP_LOSS * 100}% | TP: {TAKE_PROFIT * 100}% | Trade size: 10% or €100 max</p>
+        {/* Live Log */}
+        <div className="mt-6 bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+          <h2 className="font-semibold mb-3">📝 Live Log</h2>
+          <div className="bg-black rounded-lg p-3 h-48 overflow-y-auto font-mono text-xs">
+            {logs.length === 0 ? (
+              <div className="text-zinc-500">Waiting for activity...</div>
+            ) : (
+              logs.map((log, i) => (
+                <div key={i} className={`py-0.5 ${
+                  log.type === 'BUY' ? 'text-green-400' :
+                  log.type === 'SELL' || log.type === 'SL' ? 'text-red-400' :
+                  log.type === 'TP' ? 'text-green-400' :
+                  'text-zinc-400'
+                }`}>
+                  [{log.time.toLocaleTimeString()}] {log.message}
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Config Info */}
+        <div className="mt-4 text-xs text-zinc-600 text-center">
+          Position Size: {CONFIG.POSITION_SIZE * 100}% · Stop Loss: {CONFIG.STOP_LOSS * 100}% · Take Profit: {CONFIG.TAKE_PROFIT * 100}% · 
+          Buy RSI: &lt;{CONFIG.RSI_BUY} · Sell RSI: &gt;{CONFIG.RSI_SELL} · Poll: {CONFIG.POLL_INTERVAL / 1000}s
         </div>
       </div>
-    </main>
+    </div>
   );
 }
